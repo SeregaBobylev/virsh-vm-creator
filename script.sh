@@ -26,6 +26,7 @@ Optional:
   --disk-dir <DIR>            Directory for VM disks (default: /data/images/disks)
   --network-base <IP>         Base IP for network (default: 192.168.100.1)
   --help                      Show this help message
+  -f, --force                 Delete existing VM after confirmation
 
 Example:
   sudo $0 --name testvm --network default --ssh-key /root/.ssh/authorized_keys --template-image /data/images/debian-template.qcow2
@@ -38,6 +39,7 @@ if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     print_help
 fi
 
+force=false
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --disk-dir) vm_disk_dir="$2"; shift 2 ;;
         --network-base) network_base="$2"; shift 2 ;;
         --help|-h) print_help ;;
+        -f|--force) force=true; shift ;;
+
         *) echo "Unknown parameter: $1"; exit 1 ;;
     esac
 done
@@ -118,11 +122,24 @@ else
     echo "Network $vm_network exists, skipping."
 fi
 
-# Check if VM exists
-existing_vm=$($virsh_path list --name | grep -w "$vm_name" || true)
+existing_vm=$($virsh_path list --all --name | grep -w "$vm_name" || true)
+
 if [[ -n "$existing_vm" ]]; then
-    echo "VM $vm_name already exists, skipping creation."
-    exit 0
+    if [[ "$force" != true ]]; then
+        echo "VM $vm_name already exists. Use --force to delete it."
+        exit 1
+    fi
+
+    echo "VM $vm_name already exists."
+    read -p "Are you sure you want to DELETE it? Type 'yes': " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+
+    echo "Deleting VM $vm_name..."
+    $virsh_path destroy "$vm_name" &>/dev/null || true
+    $virsh_path undefine "$vm_name" --remove-all-storage || true
 fi
 
 echo "Creating disk..."
@@ -130,13 +147,27 @@ qemu-img create -f qcow2 -b "$template_image" "$vm_disk" -F qcow2
 assert $? "qemu-img failed"
 
 echo "Running virt-sysprep..."
-virt-sysprep -a "$vm_disk" --ssh-inject "root:file:$ssh_pub_key" --hostname "$vm_name"
+virt-sysprep -a "$vm_disk" \
+  --network \
+  --install openssh-server \
+  --run-command 'systemctl enable ssh' \
+  --ssh-inject "root:file:$ssh_pub_key" \
+  --hostname "$vm_name"
+
 assert $? "virt-sysprep failed"
 
 echo "Creating VM..."
-virt-install --name "$vm_name" --os-variant debian12 --disk "$vm_disk" --import \
-    --vcpus "$vm_vcpus" --ram "$vm_ram" --network network="$vm_network" \
-    --graphics none --autostart --noautoconsole
+virt-install --name "$vm_name" \
+  --os-variant debian12 \
+  --disk "$vm_disk" \
+  --import \
+  --vcpus "$vm_vcpus" \
+  --ram "$vm_ram" \
+  --network network="$vm_network" \
+  --graphics none \
+  --autostart \
+  --noautoconsole
+  
 assert $? "virt-install failed"
 
 echo "Waiting for VM to get an IP..."
